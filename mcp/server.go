@@ -1357,6 +1357,7 @@ func (s *Server) subscriptionsListen(ctx context.Context, req *SubscriptionsList
 	for _, uri := range allowed.ResourceSubscriptions {
 		_, err := s.subscribe(ctx, &SubscribeRequest{
 			Session: req.Session,
+			Extra:   req.Extra,
 			Params: &SubscribeParams{
 				URI:  uri,
 				Meta: req.Params.GetMeta(),
@@ -1629,12 +1630,11 @@ type ServerSession struct {
 
 	mu    sync.Mutex
 	state ServerSessionState
-	// listenIDs holds the request IDs of in-flight subscriptions/listen
-	// handlers on this session. subscriptions/listen parks on ctx.Done until
-	// cancelled, so ServerSession.Close must cancel these contexts explicitly
-	// via jsonrpc2.Connection.Cancel to avoid deadlocking on the jsonrpc2
-	// drain. See modelcontextprotocol/go-sdk#1160.
-	listenIDs []jsonrpc.ID
+	// Listen handlers park on ctx.Done, so Close must cancel them before
+	// draining the connection. Keep request-bound state rather than looking
+	// up IDs at cancellation time, since a client may reuse a completed ID.
+	listenIDs map[jsonrpc.ID]*listenState
+	closing   bool
 }
 
 func (ss *ServerSession) updateState(mut func(*ServerSessionState)) {
@@ -2108,27 +2108,33 @@ func (ss *ServerSession) handle(ctx context.Context, req *jsonrpc.Request) (any,
 		ctx = context.WithValue(ctx, logLevelContextKey{}, validatedMeta.logLevel)
 	}
 
-	// subscriptions/listen parks on ctx.Done until the peer cancels it (or the
-	// underlying reader breaks). Track the request ID so ServerSession.Close
-	// can cancel the in-flight handler via jsonrpc2.Connection.Cancel and
-	// avoid deadlocking on the jsonrpc2 drain.
-	if req.Method == methodSubscriptionsListen {
+	if req.Method == methodSubscriptionsListen && req.IsCall() {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithCancel(ctx)
+		listen := &listenState{session: ss, id: req.ID, ctx: ctx, cancel: cancel}
 		ss.mu.Lock()
-		ss.listenIDs = append(ss.listenIDs, req.ID)
+		if ss.closing {
+			ss.mu.Unlock()
+			cancel()
+			return nil, jsonrpc2.ErrServerClosing
+		}
+		if ss.listenIDs == nil {
+			ss.listenIDs = make(map[jsonrpc.ID]*listenState)
+		}
+		ss.listenIDs[req.ID] = listen
 		ss.mu.Unlock()
-		// The listen completes when the handler returns (peer cancellation,
-		// stream break, or error); drop the ID so completed listens don't
-		// accumulate in the slice indefinitely.
 		defer func() {
+			listen.finish()
 			ss.mu.Lock()
-			for i, id := range ss.listenIDs {
-				if id == req.ID {
-					ss.listenIDs = append(ss.listenIDs[:i], ss.listenIDs[i+1:]...)
-					break
-				}
-			}
+			delete(ss.listenIDs, req.ID)
 			ss.mu.Unlock()
 		}()
+		extra := new(RequestExtra)
+		if original, ok := req.Extra.(*RequestExtra); ok && original != nil {
+			*extra = *original
+		}
+		extra.CancelListen = listen.stop
+		req.Extra = extra
 	}
 
 	res, err := handleReceive(ctx, ss, req)
@@ -2230,6 +2236,9 @@ func (ss *ServerSession) setLevel(_ context.Context, params *SetLoggingLevelPara
 // requests from being handled, and waiting for ongoing requests to return.
 // Close then terminates the connection.
 //
+// Active subscriptions/listen requests are sent a best-effort
+// notifications/cancelled before their handlers are cancelled.
+//
 // Close is idempotent and concurrency safe.
 func (ss *ServerSession) Close() error {
 	if ss.keepaliveCancel != nil {
@@ -2242,16 +2251,21 @@ func (ss *ServerSession) Close() error {
 		ss.keepaliveCancel()
 	}
 
-	// Unblock any in-flight subscriptions/listen handlers, which otherwise park
-	// on ctx.Done and would deadlock conn.Close (which waits for in-flight
-	// requests to drain).
 	ss.mu.Lock()
-	ids := ss.listenIDs
-	ss.listenIDs = nil
+	ss.closing = true
+	listens := slices.Collect(maps.Values(ss.listenIDs))
 	ss.mu.Unlock()
-	for _, id := range ids {
-		ss.conn.Cancel(id)
+	var wg sync.WaitGroup
+	for _, listen := range listens {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if err := listen.stop(context.Background(), "server session closed"); err != nil {
+				ss.server.opts.Logger.Warn("cancelling subscriptions/listen", "error", err)
+			}
+		}()
 	}
+	wg.Wait()
 
 	err := ss.conn.Close()
 

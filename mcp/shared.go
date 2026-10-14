@@ -664,6 +664,17 @@ type RequestExtra struct {
 	TokenInfo *auth.TokenInfo // bearer token info (e.g. from OAuth) if any
 	Header    http.Header     // header from HTTP request, if any
 
+	// CancelListen, when non-nil, sends notifications/cancelled for this
+	// subscriptions/listen request, then cancels its handler. It is also
+	// available to SubscribeHandler for resources on that listen.
+	// It does not close the session or wait for the handler to return.
+	//
+	// Calls are concurrency-safe and share one send attempt and its error.
+	// The context bounds the send, with an additional five-second limit.
+	// The handler is cancelled even if sending fails. If the listen has already
+	// ended without an attempt, calling CancelListen is a successful no-op.
+	CancelListen func(ctx context.Context, reason string) error
+
 	// If set, CloseSSEStream explicitly closes the current SSE request stream.
 	//
 	// [SEP-1699] introduced server-side SSE stream disconnection: for

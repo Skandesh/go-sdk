@@ -516,7 +516,8 @@ type CancelledParams struct {
 	// The ID of the request to cancel.
 	//
 	// This must correspond to the ID of a request previously issued in the same
-	// direction.
+	// direction, except when a server ends a subscriptions/listen request using
+	// RequestExtra.CancelListen (protocol version 2026-07-28).
 	RequestID any `json:"requestId"`
 }
 
