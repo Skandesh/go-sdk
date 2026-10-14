@@ -34,6 +34,7 @@ func TestStreamableHTTPStructuredContentEncoding(t *testing.T) {
 		{"NaN", math.NaN(), jsonrpc2.Int64ID(1358), true},
 		{"positive_inf", math.Inf(1), jsonrpc2.StringID("infinite-result"), true},
 		{"cycle", cycle, jsonrpc2.Int64ID(1359), true},
+		{"custom_marshaler", unencodableStructuredContent{}, jsonrpc2.StringID("custom-result"), true},
 		{"large", large, jsonrpc2.Int64ID(1360), false},
 	}
 	for _, mode := range []struct {
@@ -100,6 +101,12 @@ func TestStreamableHTTPStructuredContentEncoding(t *testing.T) {
 							if rpcErr.Code != jsonrpc.CodeInternalError {
 								t.Errorf("error code = %d, want %d", rpcErr.Code, jsonrpc.CodeInternalError)
 							}
+							if rpcErr.Message != "internal error" {
+								t.Errorf("error message = %q, want generic %q", rpcErr.Message, "internal error")
+							}
+							if len(rpcErr.Data) != 0 {
+								t.Error("error response contains internal diagnostic data")
+							}
 							if len(response.Result) != 0 {
 								t.Error("error response also contains a result")
 							}
@@ -132,6 +139,12 @@ func TestStreamableHTTPStructuredContentEncoding(t *testing.T) {
 			}
 		})
 	}
+}
+
+type unencodableStructuredContent struct{}
+
+func (unencodableStructuredContent) MarshalJSON() ([]byte, error) {
+	return nil, errors.New("private marshal detail that must not reach the client")
 }
 
 func structuredContentRPC(t *testing.T, endpoint, sessionID string, message *jsonrpc.Request) (*jsonrpc.Response, string) {

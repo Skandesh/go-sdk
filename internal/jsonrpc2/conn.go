@@ -717,7 +717,7 @@ func (c *Connection) processResult(from any, req *incomingRequest, result any, e
 		if respErr != nil {
 			err = c.internalErrorf("%#v returned a malformed result for %q: %w", from, req.Method, respErr)
 			// Still answer the request so the peer and transport can complete it.
-			response = &Response{ID: req.ID, Error: err}
+			response = &Response{ID: req.ID, Error: ErrInternal}
 		}
 
 		// The caller could theoretically reuse the request's ID as soon as we've
